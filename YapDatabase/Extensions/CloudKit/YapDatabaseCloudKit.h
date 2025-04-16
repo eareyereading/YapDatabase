@@ -17,6 +17,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 extern NSString *const YapDatabaseCloudKitSuspendCountChangedNotification;
 extern NSString *const YapDatabaseCloudKitInFlightChangeSetChangedNotification;
+extern NSString *const YapDatabaseCloudKitModifyRecordProgressNotification;
+extern NSString *const YapDatabaseCloudKitModifyRecordCompletedNotification;
 
 /**
  * Welcome to YapDatabase!

@@ -16,6 +16,8 @@
 
 NSString *const YapDatabaseCloudKitSuspendCountChangedNotification = @"YDBCK_SuspendCountChanged";
 NSString *const YapDatabaseCloudKitInFlightChangeSetChangedNotification = @"YDBCK_InFlightChangeSetChanged";
+NSString *const YapDatabaseCloudKitModifyRecordProgressNotification = @"YDBCK_ModifyRecordProgress";
+NSString *const YapDatabaseCloudKitModifyRecordCompletedNotification = @"YDBCK_ModifyRecordCompleted";
 
 @implementation YapDatabaseCloudKit
 {
@@ -438,6 +440,47 @@ NSString *const YapDatabaseCloudKitInFlightChangeSetChangedNotification = @"YDBC
 		dispatch_async(dispatch_get_main_queue(), block);
 }
 
+- (void)postModifyRecordProgressNotificationForRecord:(CKRecord *)record progress:(double)progress
+{
+    dispatch_block_t block = ^{ @autoreleasepool {
+        
+        NSDictionary *details = @{
+            @"record": record,
+            @"progress": @(progress)
+        };
+        
+        [[NSNotificationCenter defaultCenter]
+          postNotificationName:YapDatabaseCloudKitModifyRecordProgressNotification
+                        object:self
+                      userInfo:details];
+    }};
+    
+    if ([NSThread isMainThread])
+        block();
+    else
+        dispatch_async(dispatch_get_main_queue(), block);
+}
+
+- (void)postModifyRecordCompletedNotificationForRecord:(CKRecord *)record error:(NSError *)error
+{
+    dispatch_block_t block = ^{ @autoreleasepool {
+        
+        NSMutableDictionary *details = [NSMutableDictionary new];
+        details[@"record"] = record;
+        details[@"error"] = error;
+        
+        [[NSNotificationCenter defaultCenter]
+          postNotificationName:YapDatabaseCloudKitModifyRecordCompletedNotification
+                        object:self
+                      userInfo:details];
+    }};
+    
+    if ([NSThread isMainThread])
+        block();
+    else
+        dispatch_async(dispatch_get_main_queue(), block);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark YapDatabaseExtension Protocol
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -612,6 +655,30 @@ NSString *const YapDatabaseCloudKitInFlightChangeSetChangedNotification = @"YDBC
 	modifyRecordsOperation.savePolicy = CKRecordSaveIfServerRecordUnchanged;
 	
 	__weak YapDatabaseCloudKit *weakSelf = self;
+    
+    modifyRecordsOperation.perRecordProgressBlock = ^(CKRecord * _Nonnull record, double progress) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic warning "-Wimplicit-retain-self"
+    
+        __strong YapDatabaseCloudKit *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        
+        [strongSelf postModifyRecordProgressNotificationForRecord:record progress:progress];
+        
+        #pragma clang diagnostic pop
+    };
+    
+    modifyRecordsOperation.perRecordCompletionBlock = ^(CKRecord * _Nonnull record, NSError * _Nullable error) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic warning "-Wimplicit-retain-self"
+
+        __strong YapDatabaseCloudKit *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+
+        [strongSelf postModifyRecordCompletedNotificationForRecord:record error:error];
+
+        #pragma clang diagnostic pop
+    };
 	
 	modifyRecordsOperation.modifyRecordsCompletionBlock =
 	    ^(NSArray *savedRecords, NSArray *deletedRecordIDs, NSError *operationError)
