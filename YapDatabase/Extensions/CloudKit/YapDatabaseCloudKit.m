@@ -19,6 +19,8 @@ NSString *const YapDatabaseCloudKitInFlightChangeSetChangedNotification = @"YDBC
 NSString *const YapDatabaseCloudKitModifyRecordProgressNotification = @"YDBCK_ModifyRecordProgress";
 NSString *const YapDatabaseCloudKitModifyRecordCompletedNotification = @"YDBCK_ModifyRecordCompleted";
 
+static const NSUInteger CloudKitMaximumNumberOfItemsInOneRequest = 400;
+
 @implementation YapDatabaseCloudKit
 {
 	NSUInteger suspendCount;
@@ -641,20 +643,100 @@ NSString *const YapDatabaseCloudKitModifyRecordCompletedNotification = @"YDBCK_M
 	
 	CKDatabase *database = [self databaseForIdentifier:changeSet.databaseIdentifier];
 	
-	NSArray *recordsToSave = changeSet.recordsToSave_noCopy;
-	NSArray *recordIDsToDelete = changeSet.recordIDsToDelete;
+    NSArray *recordsToSave = changeSet.recordsToSave_noCopy ?: @[];
+    NSArray *recordIDsToDelete = changeSet.recordIDsToDelete ?: @[];
 	
 	YDBLogVerbose(@"CKModifyRecordsOperation UPLOADING: databaseIdentifier = %@:\n"
 				  @"  recordsToSave: %@\n"
 				  @"  recordIDsToDelete: %@",
 				  changeSet.databaseIdentifier, recordsToSave, recordIDsToDelete);
-	
-	CKModifyRecordsOperation *modifyRecordsOperation =
-	  [[CKModifyRecordsOperation alloc] initWithRecordsToSave:recordsToSave recordIDsToDelete:recordIDsToDelete];
-	modifyRecordsOperation.database = database;
-	modifyRecordsOperation.savePolicy = CKRecordSaveIfServerRecordUnchanged;
-	
-	__weak YapDatabaseCloudKit *weakSelf = self;
+    
+    NSUInteger totalRecords = recordsToSave.count + recordIDsToDelete.count;
+    NSUInteger maxRecordsPerOperation = CloudKitMaximumNumberOfItemsInOneRequest;
+    
+    NSMutableArray *chunks = [NSMutableArray array];
+    if (totalRecords > maxRecordsPerOperation) {
+        // Split records into chunks
+        NSUInteger saveIndex = 0;
+        NSUInteger deleteIndex = 0;
+        
+        while (saveIndex < recordsToSave.count || deleteIndex < recordIDsToDelete.count) {
+            NSUInteger remainingCapacity = maxRecordsPerOperation;
+            
+            // Calculate saveRange
+            NSRange saveRange = NSMakeRange(saveIndex, 0);
+            if (saveIndex < recordsToSave.count) {
+                saveRange.length = MIN(remainingCapacity, recordsToSave.count - saveIndex);
+                saveIndex += saveRange.length;
+                remainingCapacity -= saveRange.length;
+            }
+            
+            // Calculate deleteRange
+            NSRange deleteRange = NSMakeRange(deleteIndex, 0);
+            if (deleteIndex < recordIDsToDelete.count && remainingCapacity > 0) {
+                deleteRange.length = MIN(remainingCapacity, recordIDsToDelete.count - deleteIndex);
+                deleteIndex += deleteRange.length;
+            }
+            
+            // Extract subarrays for the current chunk
+            NSArray *chunkRecordsToSave = [recordsToSave subarrayWithRange:saveRange];
+            NSArray *chunkRecordIDsToDelete = [recordIDsToDelete subarrayWithRange:deleteRange];
+            
+            [chunks addObject:@{
+                @"recordsToSave": chunkRecordsToSave,
+                @"recordIDsToDelete": chunkRecordIDsToDelete
+            }];
+        }
+    } else {
+        // Add a single chunk for smaller record sets
+        [chunks addObject:@{
+            @"recordsToSave": recordsToSave,
+            @"recordIDsToDelete": recordIDsToDelete
+        }];
+    }
+    
+    // Initialize accumulators
+    NSMutableArray *accumulatedSavedRecords = [NSMutableArray array];
+    NSMutableArray *accumulatedDeletedRecordIDs = [NSMutableArray array];
+    
+    // Process chunks sequentially
+    [self processChunksSequentially:chunks
+                           database:database
+                          changeSet:changeSet
+                       savedRecords:accumulatedSavedRecords
+                   deletedRecordIDs:accumulatedDeletedRecordIDs];
+}
+
+- (void)processChunksSequentially:(NSArray *)chunks
+                         database:(CKDatabase *)database
+                        changeSet:(YDBCKChangeSet *)changeSet
+                     savedRecords:(NSMutableArray *)accumulatedSavedRecords
+                 deletedRecordIDs:(NSMutableArray *)accumulatedDeletedRecordIDs
+{
+ 
+    if (chunks.count == 0) {
+        // All chunks have been processed successfully
+        YDBLogVerbose(@"All chunks processed successfully for changeSet: %@", changeSet);
+        
+        // Call handleCompletedOperationWithChangeSet with accumulated results
+        [self handleCompletedOperationWithChangeSet:changeSet
+                                       savedRecords:accumulatedSavedRecords
+                                   deletedRecordIDs:accumulatedDeletedRecordIDs];
+        return;
+    }
+    
+    NSDictionary *chunk = chunks.firstObject;
+    NSArray *remainingChunks = [chunks subarrayWithRange:NSMakeRange(1, chunks.count - 1)];
+    
+    NSArray *recordsToSave = chunk[@"recordsToSave"];
+    NSArray *recordIDsToDelete = chunk[@"recordIDsToDelete"];
+    
+    CKModifyRecordsOperation *modifyRecordsOperation =
+      [[CKModifyRecordsOperation alloc] initWithRecordsToSave:recordsToSave recordIDsToDelete:recordIDsToDelete];
+    modifyRecordsOperation.database = database;
+    modifyRecordsOperation.savePolicy = CKRecordSaveIfServerRecordUnchanged;
+    
+    __weak YapDatabaseCloudKit *weakSelf = self;
     
     modifyRecordsOperation.perRecordProgressBlock = ^(CKRecord * _Nonnull record, double progress) {
         #pragma clang diagnostic push
@@ -689,6 +771,10 @@ NSString *const YapDatabaseCloudKitModifyRecordCompletedNotification = @"YDBCK_M
 		__strong YapDatabaseCloudKit *strongSelf = weakSelf;
 		if (strongSelf == nil) return;
 		
+        // Accumulate results
+        [accumulatedSavedRecords addObjectsFromArray:savedRecords];
+        [accumulatedDeletedRecordIDs addObjectsFromArray:deletedRecordIDs];
+        
 		if (operationError)
 		{
 			if (operationError.code == CKErrorPartialFailure)
@@ -697,8 +783,8 @@ NSString *const YapDatabaseCloudKitModifyRecordCompletedNotification = @"YDBCK_M
 				           @"  error = %@", changeSet.databaseIdentifier, operationError);
 				
 				[strongSelf handlePartiallyFailedOperationWithChangeSet:changeSet
-				                                           savedRecords:savedRecords
-				                                       deletedRecordIDs:deletedRecordIDs
+				                                           savedRecords:accumulatedSavedRecords
+				                                       deletedRecordIDs:accumulatedDeletedRecordIDs
 				                                                  error:operationError];
 			}
 			else
@@ -717,9 +803,12 @@ NSString *const YapDatabaseCloudKitModifyRecordCompletedNotification = @"YDBCK_M
 			              @"  deletedRecordIDs: %@",
 			              changeSet.databaseIdentifier, savedRecords, deletedRecordIDs);
 			
-			[strongSelf handleCompletedOperationWithChangeSet:changeSet
-			                                     savedRecords:savedRecords
-			                                 deletedRecordIDs:deletedRecordIDs];
+            // Process the next chunk
+            [strongSelf processChunksSequentially:remainingChunks
+                                         database:database
+                                        changeSet:changeSet
+                                     savedRecords:accumulatedSavedRecords
+                                 deletedRecordIDs:accumulatedDeletedRecordIDs];
 		}
 		
 	#pragma clang diagnostic pop
