@@ -729,6 +729,25 @@ static const NSUInteger CloudKitMaximumNumberOfItemsInOneRequest = 400;
     NSArray *remainingChunks = [chunks subarrayWithRange:NSMakeRange(1, chunks.count - 1)];
     
     NSArray *recordsToSave = chunk[@"recordsToSave"];
+
+    // Check and clean up CKAssets with missing files to prevent iCloud sync errors
+    for (CKRecord *record in recordsToSave) {
+        NSArray *keys = [record changedKeys];
+        for (NSString *key in keys) {
+            id value = record[key];
+            if ([value isKindOfClass:[CKAsset class]]) {
+                CKAsset *asset = (CKAsset *)value;
+                if (asset.fileURL) {
+                    NSString *filePath = [asset.fileURL path];
+                    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+                        YDBLogWarn(@"CKAsset file does not exist at path: %@, setting to nil for record: %@", filePath, record.recordID);
+                        record[key] = nil;
+                    }
+                }
+            }
+        }
+    }
+
     NSArray *recordIDsToDelete = chunk[@"recordIDsToDelete"];
     
     CKModifyRecordsOperation *modifyRecordsOperation =
