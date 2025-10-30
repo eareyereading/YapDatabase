@@ -707,11 +707,45 @@ static const NSUInteger CloudKitMaximumNumberOfItemsInOneRequest = 400;
                    deletedRecordIDs:accumulatedDeletedRecordIDs];
 }
 
+/**
+ * Helper method to recreate a record from an old record.
+ * This creates a new record with the same recordID and type, but without system fields like recordChangeTag.
+ * Used when we encounter "record not found" errors from CloudKit.
+ */
+- (CKRecord *)recreateRecordFromOldRecord:(CKRecord *)oldRecord
+{
+    // Create a new record with the same recordID and recordType
+    CKRecord *newRecord = [[CKRecord alloc] initWithRecordType:oldRecord.recordType recordID:oldRecord.recordID];
+
+    // Copy all user fields (but not system fields)
+    NSArray *keys = [oldRecord allKeys];
+    for (NSString *key in keys) {
+        newRecord[key] = oldRecord[key];
+    }
+
+    return newRecord;
+}
+
 - (void)processChunksSequentially:(NSArray *)chunks
                          database:(CKDatabase *)database
                         changeSet:(YDBCKChangeSet *)changeSet
                      savedRecords:(NSMutableArray *)accumulatedSavedRecords
                  deletedRecordIDs:(NSMutableArray *)accumulatedDeletedRecordIDs
+{
+    [self processChunksSequentially:chunks
+                           database:database
+                          changeSet:changeSet
+                       savedRecords:accumulatedSavedRecords
+                   deletedRecordIDs:accumulatedDeletedRecordIDs
+                         savePolicy:CKRecordSaveIfServerRecordUnchanged];
+}
+
+- (void)processChunksSequentially:(NSArray *)chunks
+                         database:(CKDatabase *)database
+                        changeSet:(YDBCKChangeSet *)changeSet
+                     savedRecords:(NSMutableArray *)accumulatedSavedRecords
+                 deletedRecordIDs:(NSMutableArray *)accumulatedDeletedRecordIDs
+                       savePolicy:(CKRecordSavePolicy)savePolicy
 {
  
     if (chunks.count == 0) {
@@ -753,7 +787,7 @@ static const NSUInteger CloudKitMaximumNumberOfItemsInOneRequest = 400;
     CKModifyRecordsOperation *modifyRecordsOperation =
       [[CKModifyRecordsOperation alloc] initWithRecordsToSave:recordsToSave recordIDsToDelete:recordIDsToDelete];
     modifyRecordsOperation.database = database;
-    modifyRecordsOperation.savePolicy = CKRecordSaveIfServerRecordUnchanged;
+    modifyRecordsOperation.savePolicy = savePolicy;
     
     __weak YapDatabaseCloudKit *weakSelf = self;
     
@@ -800,11 +834,101 @@ static const NSUInteger CloudKitMaximumNumberOfItemsInOneRequest = 400;
 			{
 				YDBLogInfo(@"CKModifyRecordsOperation partial error: databaseIdentifier = %@\n"
 				           @"  error = %@", changeSet.databaseIdentifier, operationError);
-				
-				[strongSelf handlePartiallyFailedOperationWithChangeSet:changeSet
-				                                           savedRecords:accumulatedSavedRecords
-				                                       deletedRecordIDs:accumulatedDeletedRecordIDs
-				                                                  error:operationError];
+
+				// Check if there are "record not found" errors that we can retry
+				NSDictionary *partialErrorsByItemID = [operationError.userInfo objectForKey:CKPartialErrorsByItemIDKey];
+				NSMutableSet *recordNotFoundIDs = [NSMutableSet set];
+
+				[partialErrorsByItemID enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+					CKRecordID *recordID = (CKRecordID *)key;
+					NSError *recordError = (NSError *)obj;
+
+					// CKErrorUnknownItem (code 11) indicates "record not found"
+					if (recordError.code == CKErrorUnknownItem) {
+						[recordNotFoundIDs addObject:recordID];
+						YDBLogInfo(@"Detected 'record not found' error for recordID: %@", recordID);
+					}
+				}];
+
+				// If we have "record not found" errors and haven't already retried
+				if (recordNotFoundIDs.count > 0 && savePolicy != CKRecordSaveAllKeys) {
+					// Create a set of successfully saved record IDs for quick lookup
+					NSMutableSet *savedRecordIDs = [NSMutableSet setWithCapacity:savedRecords.count];
+					for (CKRecord *record in savedRecords) {
+						[savedRecordIDs addObject:record.recordID];
+					}
+
+					// Collect failed records, separating "record not found" from others
+					NSMutableArray *recreatedRecords = [NSMutableArray array];
+					NSMutableArray *otherFailedRecords = [NSMutableArray array];
+
+					for (CKRecord *record in recordsToSave) {
+						// If not in savedRecords, it failed and needs retry
+						if (![savedRecordIDs containsObject:record.recordID]) {
+							if ([recordNotFoundIDs containsObject:record.recordID]) {
+								// Recreate this record without system fields for "record not found" errors
+								CKRecord *newRecord = [strongSelf recreateRecordFromOldRecord:record];
+								[recreatedRecords addObject:newRecord];
+								YDBLogInfo(@"Recreating record due to 'record not found' error: %@", record.recordID);
+							} else {
+								// Keep the original record for other types of errors
+								[otherFailedRecords addObject:record];
+							}
+						}
+					}
+
+					// Create a set of successfully deleted record IDs for quick lookup
+					NSSet *deletedRecordIDsSet = [NSSet setWithArray:deletedRecordIDs];
+
+					// Collect all failed recordIDs for deletion retry
+					NSMutableArray *recordIDsToRetryDelete = [NSMutableArray array];
+					for (CKRecordID *recordID in recordIDsToDelete) {
+						// If not in deletedRecordIDs, it failed and needs retry
+						if (![deletedRecordIDsSet containsObject:recordID]) {
+							[recordIDsToRetryDelete addObject:recordID];
+						}
+					}
+
+					YDBLogInfo(@"Retrying %lu recreated records (CKRecordSaveAllKeys), %lu other failed records and %lu failed deletes (CKRecordSaveIfServerRecordUnchanged)",
+					          (unsigned long)recreatedRecords.count, (unsigned long)otherFailedRecords.count, (unsigned long)recordIDsToRetryDelete.count);
+
+					// Create separate chunks for different save policies
+					NSMutableArray *retryChunks = [NSMutableArray array];
+
+					// Chunk 1: Recreated records (must use CKRecordSaveAllKeys)
+					if (recreatedRecords.count > 0) {
+						[retryChunks addObject:@{
+							@"recordsToSave": recreatedRecords,
+							@"recordIDsToDelete": @[]
+						}];
+					}
+
+					// Chunk 2: Other failed records and deletes (use CKRecordSaveIfServerRecordUnchanged)
+					if (otherFailedRecords.count > 0 || recordIDsToRetryDelete.count > 0) {
+						[retryChunks addObject:@{
+							@"recordsToSave": otherFailedRecords,
+							@"recordIDsToDelete": recordIDsToRetryDelete
+						}];
+					}
+
+					// Concatenate with remaining chunks
+					NSMutableArray *allRemainingChunks = [NSMutableArray arrayWithArray:retryChunks];
+					[allRemainingChunks addObjectsFromArray:remainingChunks];
+
+					// Retry with CKRecordSaveAllKeys policy (will auto-switch back to CKRecordSaveIfServerRecordUnchanged for chunk 2)
+					[strongSelf processChunksSequentially:allRemainingChunks
+					                             database:database
+					                            changeSet:changeSet
+					                         savedRecords:accumulatedSavedRecords
+					                     deletedRecordIDs:accumulatedDeletedRecordIDs
+					                           savePolicy:CKRecordSaveAllKeys];
+				} else {
+					// Handle the partial failure normally
+					[strongSelf handlePartiallyFailedOperationWithChangeSet:changeSet
+					                                           savedRecords:accumulatedSavedRecords
+					                                       deletedRecordIDs:accumulatedDeletedRecordIDs
+					                                                  error:operationError];
+				}
 			}
 			else
 			{
@@ -827,7 +951,8 @@ static const NSUInteger CloudKitMaximumNumberOfItemsInOneRequest = 400;
                                          database:database
                                         changeSet:changeSet
                                      savedRecords:accumulatedSavedRecords
-                                 deletedRecordIDs:accumulatedDeletedRecordIDs];
+                                 deletedRecordIDs:accumulatedDeletedRecordIDs
+                                       savePolicy:CKRecordSaveIfServerRecordUnchanged];
 		}
 		
 	#pragma clang diagnostic pop
