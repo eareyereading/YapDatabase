@@ -116,14 +116,17 @@ databaseIdentifier:(NSString *)inDatabaseIdentifier
 - (NSArray *)recordsToSave_noCopy
 {
 	if (modifiedRecords.count == 0) return nil;
-	
+
 	NSMutableArray *array = [NSMutableArray arrayWithCapacity:[modifiedRecords count]];
-	
+
 	for (YDBCKChangeRecord *changeRecord in [modifiedRecords objectEnumerator])
 	{
-		[array addObject:changeRecord.record];
+		if (changeRecord.record != nil)
+		{
+			[array addObject:changeRecord.record];
+		}
 	}
-	
+
 	return array;
 }
 
