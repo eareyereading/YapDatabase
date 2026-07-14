@@ -1303,7 +1303,17 @@
 		
 		NSString *pageKey = pageMetadata->pageKey;
 		YapDatabaseViewPage *page = [self pageForPageKey:pageKey];
-		
+
+		if (page == nil)
+		{
+			// The page referenced by pageMetadata is missing from the page table (index corruption).
+			// Skip indexing this rowid to avoid setObject:forKey: with nil object crashing the app.
+			// The object remains stored in the database; it just won't appear in this view until rebuild.
+			YDBLogError(@"(%@): Missing page(%@) in group(%@) during insert of collection(%@) key(%@)",
+			            [self registeredName], pageKey, group, collectionKey.collection, collectionKey.key);
+			return;
+		}
+
 		YDBLogVerbose(@"Inserting key(%@) collection(%@) in group(%@) at index(%lu) with page(%@) pageOffset(%lu)",
 		              collectionKey.key, collectionKey.collection, group,
 		              (unsigned long)index, pageKey, (unsigned long)(index - pageOffset));
