@@ -23,6 +23,16 @@ typedef NS_ENUM(NSInteger, YDB_NotifyReason) {
 	YDB_EdgeDeleted,
 	YDB_SourceNodeDeleted,
 	YDB_DestinationNodeDeleted,
+
+	/**
+	 * The destination row never existed in this database.
+	 *
+	 * E.g. the source node was written before the destination node during a batched restore / sync,
+	 * so the edge could not be resolved at the time the source was saved.
+	 * This is distinguishable from a real deletion (YDB_DestinationNodeDeleted), which is only reported
+	 * for a destination row that did exist and was then removed.
+	 */
+	YDB_DestinationNodeNeverExisted,
 };
 
 

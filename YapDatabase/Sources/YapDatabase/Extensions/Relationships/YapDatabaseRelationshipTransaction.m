@@ -3249,9 +3249,15 @@ NS_INLINE BOOL URLMatchesURL(NSURL *url1, NSURL *url2)
 							SEL selector = @selector(yapDatabaseRelationshipEdgeDeleted:withReason:);
 							if ([sourceNode respondsToSelector:selector])
 							{
+								// A bad destination means the destination row never existed (as opposed to
+								// having been deleted). Report the two cases separately so the source node
+								// can tell "the target isn't here yet" from "the target is gone".
+								YDB_NotifyReason reason = (edge->flags & YDB_EdgeFlags_BadDestination)
+								                        ? YDB_DestinationNodeNeverExisted
+								                        : YDB_DestinationNodeDeleted;
+
 								id updatedSourceNode =
-								  [sourceNode yapDatabaseRelationshipEdgeDeleted:edge
-								                                      withReason:YDB_DestinationNodeDeleted];
+								  [sourceNode yapDatabaseRelationshipEdgeDeleted:edge withReason:reason];
 					
 								if (edge->nodeDeleteRules & YDB_DeleteSourceIfDestinationDeleted)
 								{
@@ -3508,8 +3514,12 @@ NS_INLINE BOOL URLMatchesURL(NSURL *url1, NSURL *url2)
 							SEL selector = @selector(yapDatabaseRelationshipEdgeDeleted:withReason:);
 							if ([sourceNode respondsToSelector:selector])
 							{
-								(void)[sourceNode yapDatabaseRelationshipEdgeDeleted:edge
-								                                          withReason:YDB_DestinationNodeDeleted];
+								// See note above: a bad destination never existed, it wasn't deleted.
+								YDB_NotifyReason reason = (edge->flags & YDB_EdgeFlags_BadDestination)
+								                        ? YDB_DestinationNodeNeverExisted
+								                        : YDB_DestinationNodeDeleted;
+
+								(void)[sourceNode yapDatabaseRelationshipEdgeDeleted:edge withReason:reason];
 							}
 						}
 						
@@ -3799,8 +3809,13 @@ NS_INLINE BOOL URLMatchesURL(NSURL *url1, NSURL *url2)
 						SEL selector = @selector(yapDatabaseRelationshipEdgeDeleted:withReason:);
 						if ([srcNode respondsToSelector:selector])
 						{
+							// See note above: a bad destination never existed, it wasn't deleted.
+							YDB_NotifyReason reason = (edge->flags & YDB_EdgeFlags_BadDestination)
+							                        ? YDB_DestinationNodeNeverExisted
+							                        : YDB_DestinationNodeDeleted;
+
 							id updatedSrcNode =
-							  [srcNode yapDatabaseRelationshipEdgeDeleted:edge withReason:YDB_DestinationNodeDeleted];
+							  [srcNode yapDatabaseRelationshipEdgeDeleted:edge withReason:reason];
 							
 							if (shouldDeleteSource)
 							{
