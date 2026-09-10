@@ -103,7 +103,15 @@ databaseIdentifier:(NSString *)inDatabaseIdentifier
 	
 	for (YDBCKChangeRecord *changeRecord in [modifiedRecords objectEnumerator])
 	{
-		[array addObject:[changeRecord.record safeCopy]];
+		// changeRecord.record 可以是 nil：restoreMasterChangeQueue 在记录表那行和映射行都不
+		// 存在时，会把恢复块返回的 nil 直接赋进来（YDBCKChangeSet.m 的
+		// enumerateMissingRecordsWithBlock:）。safeCopy 一个 nil 还是 nil，NSMutableArray
+		// 装不下 nil，于是这里会抛 NSInvalidArgumentException。
+		// recordsToSave_noCopy 早就这么防了，公开的这个访问器一直漏着。
+		if (changeRecord.record != nil)
+		{
+			[array addObject:[changeRecord.record safeCopy]];
+		}
 	}
 	
 	return array;
@@ -142,7 +150,12 @@ databaseIdentifier:(NSString *)inDatabaseIdentifier
 	
 	for (YDBCKChangeRecord *changeRecord in [modifiedRecords objectEnumerator])
 	{
-		[array addObject:changeRecord.recordID];
+		// 同 recordsToSave：recordID 的 getter 在显式 recordID 为空时回退到 record.recordID，
+		// 而 setRecord: 会先把显式 recordID 置空，所以 record 被赋成 nil 的那条记录两者都是 nil。
+		if (changeRecord.recordID != nil)
+		{
+			[array addObject:changeRecord.recordID];
+		}
 	}
 	
 	return array;
