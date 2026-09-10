@@ -26,7 +26,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, readonly) NSArray<CKRecordID *> *recordIDsToDelete; // Array of CKRecordID's for CKModifyRecordsOperation
 @property (nonatomic, readonly) NSArray<CKRecord *> *recordsToSave;     // Array of CKRecord's for CKModifyRecordsOperation
-@property (nonatomic, readonly) NSArray<CKRecordID *> *recordIDsToSave;   // Array of CKRecordID's (from recordsToSave)
+// Array of CKRecordID's. NOT index-aligned with recordsToSave: both accessors now skip entries whose
+// backing record could not be restored, but on different predicates (record == nil vs recordID == nil).
+// Today those two sets coincide (setRecord: nils the stored recordID whenever it assigns), so the arrays
+// happen to correspond — do not rely on it.
+@property (nonatomic, readonly) NSArray<CKRecordID *> *recordIDsToSave;
 
 @property (nonatomic, readonly) NSUInteger recordIDsToDeleteCount; // shortcut if you just want the count
 @property (nonatomic, readonly) NSUInteger recordsToSaveCount;     // shortcut if you just want the count
